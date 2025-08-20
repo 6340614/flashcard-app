@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>フラッシュカード（ローカル・サーバ不要）</title>
+  <style>
+    :root{ --bg:#0b1220; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#22c55e; --blue:#3b82f6; --amber:#f59e0b; --violet:#8b5cf6; --danger:#ef4444; --slate:#64748b; --radius:14px; }
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:linear-gradient(180deg,var(--bg),#0f172a);color:var(--text)}
+    .app{max-width:1100px;margin:0 auto;padding:16px}
+    header{position:sticky;top:0;background:rgba(7,14,24,.7);backdrop-filter:blur(6px);padding:12px;border-bottom:1px solid rgba(148,163,184,.06);display:flex;align-items:center;gap:12px;z-index:2}
+    .title{font-weight:700;font-size:18px}
+    #backBtn{margin-left:6px}
+    .panel{background:rgba(17,24,39,.75);border-radius:var(--radius);padding:14px;border:1px solid rgba(148,163,184,.06);box-shadow:0 6px 18px rgba(2,6,23,.5)}
+    input,textarea,select{width:100%;padding:10px;border-radius:10px;background:#07101b;border:1px solid rgba(148,163,184,.06);color:var(--text);box-sizing:border-box}
+    button{border:none;padding:10px 12px;border-radius:10px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px}
+    .btn-blue{background:var(--blue);color:#fff}
+    .btn-amber{background:var(--amber);color:#000}
+    .btn-green{background:var(--accent);color:#072a12}
+    .btn-violet{background:var(--violet);color:#fff}
+    .btn-danger{background:var(--danger);color:#fff}
+    .btn-slate{background:var(--slate);color:#fff}
+    .btn-outline{background:transparent;color:var(--text);border:1px solid rgba(148,163,184,.08)}
+    .listgrid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:12px}
+    @media (max-width:1024px){.listgrid{grid-template-columns:repeat(8,1fr)}}
+    @media (max-width:640px){.listgrid{grid-template-columns:repeat(4,1fr)}}
+    .listcard{grid-column:span 4;background:linear-gradient(180deg,#0c1622,#0f1a2a);padding:12px;border-radius:12px;display:flex;flex-direction:column;gap:8px}
+    .listcard h4{margin:0;font-size:16px}
+    .meta{font-size:12px;color:var(--muted)}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+    .stack{display:flex;flex-direction:column;gap:12px}
+    .thumb{width:52px;height:52px;border-radius:8px;object-fit:cover;border:1px solid rgba(148,163,184,.06);cursor:pointer}
+    .empty{text-align:center;padding:36px;color:var(--muted)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid rgba(148,163,184,.06);vertical-align:middle}
+
+    /* modal */
+    .modal{display:none;position:fixed;z-index:9999;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.86);align-items:center;justify-content:center}
+    .modal img{max-width:92%;max-height:92%;border-radius:10px}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <button id="backBtn" class="btn btn-slate" style="display:none">🏠 リスト一覧へ</button>
+      <div class="title">フラッシュカード（ローカル）</div>
+    </header>
+
+    <main id="view" style="margin-top:12px"></main>
+  </div>
+
+  <div id="imgModal" class="modal"><img id="imgModalImg" src="" alt=""/></div>
+
+  <script>
+  (function(){
+    // ==== Utilities (JST対応) ====
+    const $ = (s, r=document)=> r.querySelector(s);
+    const create = (tag, attrs={})=>{ const e = document.createElement(tag); for(const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+    const pad2 = n=> String(n).padStart(2,'0');
+    const jstDateObj = (d=new Date())=>{ // DateをJSTの同一時刻表示に合わせたDate(ローカル)へ
+      const s = d.toLocaleString('en-US', { timeZone: 'Asia/Tokyo' });
+      return new Date(s);
+    };
+    const jstISO = (d=new Date())=>{ const x=jstDateObj(d); return `${x.getFullYear()}-${pad2(x.getMonth()+1)}-${pad2(x.getDate())}`; };
+    const jstTodayISO = ()=> jstISO(new Date());
+    const jstTime = ()=>{ const x=jstDateObj(new Date()); return `${pad2(x.getHours())}:${pad2(x.getMinutes())}`; };
+    const fmt = (iso)=> iso? iso.replace(/-/g,'/') : '';
+    const uuid = ()=> (crypto && crypto.randomUUID)? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{ const r=Math.random()*16|0; const v=c==='x'?r:(r&0x3|0x8); return v.toString(16); });
+
+    async function fileToDataURLCompressed(file, maxSide=1280, quality=0.85){
+      const dataURL = await new Promise((res,rej)=>{ const fr=new FileReader(); fr.onerror=rej; fr.onload=()=>res(fr.result); fr.readAsDataURL(file); });
+      const img = await new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=dataURL; });
+      const scale = Math.min(1, maxSide/Math.max(img.width,img.height));
+      const cw = Math.max(1, Math.round(img.width*scale));
+      const ch = Math.max(1, Math.round(img.height*scale));
+      const canvas = document.createElement('canvas'); canvas.width=cw; canvas.height=ch; const ctx=canvas.getContext('2d'); ctx.drawImage(img,0,0,cw,ch);
+      return canvas.toDataURL('image/jpeg', quality);
+    }
+
+    const SCHEDULE_OFFSETS = [0,1,3,7,14,30,90];
+
+    // ==== storage ====
+    const KEY = 'flashcards_local_v4';
+    function load(){ try{ const raw = localStorage.getItem(KEY); if(!raw) return {lists:[],cards:[]}; const d=JSON.parse(raw); d.lists ||= []; d.cards ||= []; return d;}catch(e){ console.error(e); return {lists:[],cards:[]}; } }
+    function save(){ localStorage.setItem(KEY, JSON.stringify(DB)); }
+    let DB = load();
+
+    // ==== navigation ====
+    const stack = [];
+    function go(screen, params={}){ stack.push({screen, params}); render(); }
+    function goHome(){ stack.length = 0; stack.push({screen:'home',params:{}}); render(); }
+
+    // ==== schedule helpers ====
+    function nextDueDate(card){
+      const n = card.attempts?.length || 0;
+      if(n >= 7) return null; // finished
+      if(card.manualNextDue) return card.manualNextDue; // manual override
+      if(n === 0) return card.createdAt; // 1回目＝登録日（JST）
+      const lastDate = (card.attempts[n-1].date);
+      const offset = SCHEDULE_OFFSETS[n];
+      const [y,m,d] = lastDate.split('-').map(Number);
+      const base = new Date(Date.UTC(y, m-1, d)); // UTC基準で日付演算ズレ回避
+      base.setUTCDate(base.getUTCDate()+offset);
+      const y2 = base.getUTCFullYear(); const m2 = pad2(base.getUTCMonth()+1); const d2 = pad2(base.getUTCDate());
+      return `${y2}-${m2}-${d2}`;
+    }
+    const isDueTodayOrPast = (card)=>{ const nd = nextDueDate(card); return nd && nd <= jstTodayISO(); };
+
+    // ==== models ====
+    function createList(name){ const id = uuid(); DB.lists.push({id,name,createdAt:jstTodayISO()}); save(); return id; }
+    function deleteList(id){ DB.lists = DB.lists.filter(l=>l.id!==id); DB.cards = DB.cards.filter(c=>c.listId!==id); save(); }
+    function createCard(listId, {qText,qImg,aText,aImg}){ const id = uuid(); DB.cards.push({id,listId,createdAt:jstTodayISO(),qText:qText||'',qImg:qImg||'',aText:aText||'',aImg:aImg||'',attempts:[],manualNextDue:null}); save(); return id; }
+    function updateCard(id, patch){ const c = DB.cards.find(x=>x.id===id); if(!c) return; Object.assign(c, patch); save(); }
+    function deleteCard(id){ DB.cards = DB.cards.filter(x=>x.id!==id); save(); }
+    const listCards = (listId)=> DB.cards.filter(x=>x.listId===listId);
+
+    // ==== UI render ====
+    function render(){
+      const view = $('#view');
+      const top = stack[stack.length-1] || {screen:'home',params:{}};
+      // 出題モード含め、ホーム以外は常に戻る表示→ホームに戻る
+      $('#backBtn').style.display = top.screen !== 'home' ? 'inline-flex' : 'none';
+      $('#backBtn').onclick = ()=> goHome();
+
+      switch(top.screen){
+        case 'home': return renderHome(view);
+        case 'listMenu': return renderListMenu(view, top.params);
+        case 'register': return renderRegister(view, top.params);
+        case 'quiz': return renderQuiz(view, top.params);
+        case 'problems': return renderProblems(view, top.params);
+        case 'edit': return renderEdit(view, top.params);
+        default: return renderHome(view);
+      }
+    }
+
+    function renderHome(view){
+      setTitle('フラッシュカード — リスト');
+      view.innerHTML = '';
+      const wrap = create('div'); wrap.className = 'stack';
+
+      const form = create('div'); form.className = 'panel'; form.style.padding='12px';
+      form.innerHTML = `
+        <h3 style="margin:0 0 8px 0">リスト作成</h3>
+        <label style="color:var(--muted);font-size:13px">リスト名</label>
+        <input id="newListName" placeholder="例：英単語、歴史、資格…" />
+        <div style="margin-top:10px;display:flex;gap:8px"><button id="createListBtn" class="btn btn-green">＋ 作成</button></div>
+        <div style="margin-top:8px;color:var(--muted);font-size:13px">全データは端末ローカル（localStorage）に保存されます。JST基準で日付保存。</div>
+      `;
+      wrap.appendChild(form);
+
+      const listsPanel = create('div'); listsPanel.className = 'panel'; listsPanel.style.marginTop='12px';
+      listsPanel.innerHTML = `<h3 style="margin:0 0 8px 0">リスト一覧</h3>`;
+      const grid = create('div'); grid.className='listgrid';
+
+      if(DB.lists.length === 0){ const e = create('div'); e.className='empty'; e.textContent='リストがありません。上の「リスト作成」から追加してください。'; listsPanel.appendChild(e); }
+      else{
+        DB.lists.forEach(l=>{
+          const total = listCards(l.id).length;
+          const due = listCards(l.id).filter(isDueTodayOrPast).length;
+          const card = create('div'); card.className='listcard';
+          const h = create('h4'); h.textContent = l.name; card.appendChild(h);
+          const m = create('div'); m.className='meta'; m.textContent = `作成 ${fmt(l.createdAt)} ・ 登録 ${total} 件 ・ 期日到来 ${due} 件`; card.appendChild(m);
+          const tb = create('div'); tb.className='toolbar';
+          // 選択ボタンは不要 → 削除
+          const add = create('button'); add.className='btn btn-blue'; add.textContent='✏️ 問題登録'; add.onclick = ()=> go('register',{listId:l.id}); tb.appendChild(add);
+          const prob = create('button'); prob.className='btn btn-amber'; prob.textContent='📋 問題一覧'; prob.onclick = ()=> go('problems',{listId:l.id}); tb.appendChild(prob);
+          const quiz = create('button'); quiz.className='btn btn-violet'; quiz.textContent='📝 出題開始'; quiz.onclick = ()=> go('quiz',{listId:l.id}); tb.appendChild(quiz);
+          const del = create('button'); del.className='btn btn-danger'; del.textContent='🗑 削除'; del.onclick = ()=>{ if(confirm(`「${l.name}」を削除しますか？（中の問題も削除されます）`)){ deleteList(l.id); render(); } }; tb.appendChild(del);
+          card.appendChild(tb); grid.appendChild(card);
+        });
+        listsPanel.appendChild(grid);
+      }
+      wrap.appendChild(listsPanel);
+      view.appendChild(wrap);
+
+      $('#createListBtn').onclick = ()=>{
+        const name = $('#newListName').value.trim();
+        if(!name){ alert('リスト名を入力してください'); return; }
+        if(DB.lists.some(x=>x.name===name)){ alert('同名のリストが既にあります'); return; }
+        const id = createList(name);
+        $('#newListName').value='';
+        go('listMenu',{listId:id});
+      }
+    }
+
+    function renderListMenu(view,{listId}){
+      const list = DB.lists.find(x=>x.id===listId);
+      if(!list){ goHome(); return; }
+      setTitle(`リスト：${list.name}`);
+      view.innerHTML = '';
+      const panel = create('div'); panel.className='panel'; panel.innerHTML = `
+        <h3 style="margin:0 0 8px 0">${escapeHtml(list.name)}</h3>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <button id="toAdd" class="btn btn-blue">✏️ 問題登録</button>
+          <button id="toQuiz" class="btn btn-violet">📝 出題</button>
+          <button id="toList" class="btn btn-amber">📋 問題一覧</button>
+        </div>
+      `;
+      view.appendChild(panel);
+      $('#toAdd').onclick = ()=> go('register',{listId});
+      $('#toQuiz').onclick = ()=> go('quiz',{listId});
+      $('#toList').onclick = ()=> go('problems',{listId});
+    }
+
+    function renderRegister(view,{listId}){
+      const list = DB.lists.find(x=>x.id===listId); if(!list){ goHome(); return; }
+      setTitle(`問題登録（${list.name}）`);
+      view.innerHTML = '';
+      const form = create('form'); form.className='panel'; form.id='regForm';
+      form.innerHTML = `
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <label>問題（文章）</label>
+            <textarea id="qText" rows="4" placeholder="問題文"></textarea>
+          </div>
+          <div style="width:260px">
+            <label>問題（画像）</label>
+            <input type="file" id="qImg" accept="image/*" />
+            <img id="qPreview" class="thumb" style="display:none;margin-top:8px" />
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+          <div style="flex:1;min-width:220px">
+            <label>回答（文章）</label>
+            <textarea id="aText" rows="4" placeholder="回答"></textarea>
+          </div>
+          <div style="width:260px">
+            <label>回答（画像）</label>
+            <input type="file" id="aImg" accept="image/*" />
+            <img id="aPreview" class="thumb" style="display:none;margin-top:8px" />
+          </div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-green">＋ 登録する</button>
+          <button type="button" class="btn btn-outline" id="clearBtn">クリア</button>
+          <button type="button" class="btn btn-amber" id="toListBtn">📋 問題一覧へ</button>
+        </div>
+        <div style="margin-top:8px;color:var(--muted);font-size:13px">文章・画像は両方とも空にできません。画像は自動圧縮保存（JPG）されます。</div>
+      `;
+      view.appendChild(form);
+
+      const qImg = $('#qImg', form); const aImg = $('#aImg', form);
+      qImg.onchange = async ()=>{ const f=qImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#qPreview', form).src = url; $('#qPreview', form).style.display='block'; }
+      aImg.onchange = async ()=>{ const f=aImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#aPreview', form).src = url; $('#aPreview', form).style.display='block'; }
+      $('#clearBtn', form).onclick = ()=>{ $('#qText', form).value=''; $('#aText', form).value=''; $('#qPreview', form).style.display='none'; $('#aPreview', form).style.display='none'; qImg.value=''; aImg.value=''; }
+      $('#toListBtn', form).onclick = ()=> go('problems',{listId});
+
+      form.onsubmit = async (e)=>{ e.preventDefault(); const qText = $('#qText', form).value.trim(); const aText = $('#aText', form).value.trim(); let qImgData=''; let aImgData=''; if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]); if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]); if(!qText && !qImgData){ alert('問題の文章または画像を入力してください'); return; } if(!aText && !aImgData){ alert('回答の文章または画像を入力してください'); return; } createCard(listId,{qText,qImg:qImgData,aText,aImg:aImgData}); if(confirm('登録しました。続けて登録しますか？')){ $('#qText', form).value=''; $('#aText', form).value=''; $('#qPreview', form).style.display='none'; $('#aPreview', form).style.display='none'; qImg.value=''; aImg.value=''; } else { go('listMenu',{listId}); } };
+    }
+
+    function renderQuiz(view,{listId}){
+      const list = DB.lists.find(x=>x.id===listId); if(!list){ goHome(); return; }
+      setTitle(`出題（${list.name}）`);
+      view.innerHTML = '';
+      const due = listCards(listId).filter(c=> isDueTodayOrPast(c) && (c.attempts?.length || 0) < 7);
+      if(due.length === 0){ const p = create('div'); p.className='panel empty'; p.innerHTML = `<div>本日出題する問題はありません。</div><div style="margin-top:10px"><button class='btn btn-slate' id='toHomeBtn'>🏠 リスト一覧へ</button></div>`; view.appendChild(p); $('#toHomeBtn').onclick = ()=> goHome(); return; }
+
+      due.sort((a,b)=>{ const da = nextDueDate(a) || '9999-99-99'; const db = nextDueDate(b) || '9999-99-99'; if(da !== db) return da < db ? -1 : 1; return a.createdAt < b.createdAt ? -1 : 1; });
+
+      let idx = 0;
+      const wrap = create('div'); wrap.className='stack';
+      const top = create('div'); top.className='panel'; top.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div><div class='meta'>残り <span id='remain'>${due.length}</span> 問</div><div class='meta'>本日 ${fmt(jstTodayISO())}</div></div><div></div></div>`;
+      const qPanel = create('div'); qPanel.className='panel'; qPanel.style.marginTop='10px'; qPanel.innerHTML = `<div id='qArea' class='quiz-q'></div><div id='qImgArea' style='margin-top:10px'></div><div style='margin-top:12px'><button id='revealBtn' class='btn btn-blue'>答えを見る</button></div><div id='answerBox' style='display:none;margin-top:12px'><div id='aArea' class='quiz-a'></div><div id='aImgArea' style='margin-top:8px'></div><div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button id='correctBtn' class='btn btn-green'>○ 正解</button><button id='wrongBtn' class='btn btn-danger'>× 不正解</button></div></div>`;
+      const histPanel = create('div'); histPanel.className='panel'; histPanel.style.marginTop='10px'; histPanel.innerHTML = `<h4 style='margin:0 0 8px 0'>この問題の履歴</h4><div id='hist'></div>`;
+      const donePanel = create('div'); donePanel.className='panel'; donePanel.style.display='none'; donePanel.innerHTML = `<div class='empty'>本日の出題は全て終了しました。<div style='margin-top:10px'><button id='toHome' class='btn btn-slate'>🏠 リスト一覧へ</button></div></div>`;
+
+      wrap.appendChild(top); wrap.appendChild(qPanel); wrap.appendChild(histPanel); wrap.appendChild(donePanel); view.appendChild(wrap);
+
+      function renderCard(){ const c = due[idx]; $('#qArea').textContent = c.qText || (c.qImg? '（画像問題）':''); $('#qImgArea').innerHTML = c.qImg? `<img src='${c.qImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : ''; $('#aArea').textContent = c.aText || (c.aImg? '（画像回答）':''); $('#aImgArea').innerHTML = c.aImg? `<img src='${c.aImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : ''; $('#answerBox').style.display='none'; renderHistory(c); }
+      function renderHistory(c){ const el = $('#hist'); if(!(c.attempts && c.attempts.length)) { el.innerHTML = `<div class='meta'>履歴はまだありません。初回出題日：${fmt(nextDueDate(c))}</div>`; return; } const rows = c.attempts.map((a,i)=>`<div style='display:flex;justify-content:space-between'><div><span class='meta'>${i+1}回目</span> ${fmt(a.date)} ${a.time||''}</div><div><span class='meta'>${a.correct? '正解':'不正解'}</span></div></div>`).join(''); const next = nextDueDate(c); el.innerHTML = rows + (next? `<div style='margin-top:8px' class='meta'>次回出題予定日：${fmt(next)}</div>` : `<div style='margin-top:8px' class='meta'>7回目まで完了。以降の出題はありません。</div>`); }
+
+      $('#revealBtn').onclick = ()=> { $('#answerBox').style.display='block'; };
+      $('#correctBtn').onclick = ()=> grade(true);
+      $('#wrongBtn').onclick = ()=> grade(false);
+
+      function grade(correct){ const c = due[idx]; c.attempts.push({date: jstTodayISO(), time: jstTime(), correct}); if(c.manualNextDue) delete c.manualNextDue; save(); idx++; if(idx>=due.length){ qPanel.style.display='none'; donePanel.style.display='block'; $('#toHome').onclick = ()=> goHome(); } else { $('#remain').textContent = (due.length - idx); renderCard(); } }
+
+      renderCard();
+    }
+
+    function renderProblems(view,{listId}){
+      const list = DB.lists.find(x=>x.id===listId); if(!list){ goHome(); return; }
+      setTitle(`問題一覧（${list.name}）`);
+      view.innerHTML = '';
+      const head = create('div'); head.className='panel'; head.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center'><div><h3 style='margin:0'>登録問題</h3><div class='meta'>合計 ${listCards(listId).length} 件</div></div><div><button id='addNew' class='btn btn-blue'>＋ 新規登録</button></div></div>`;
+      view.appendChild(head);
+      $('#addNew').onclick = ()=> go('register',{listId});
+
+      const items = listCards(listId).slice().sort((a,b)=> a.createdAt < b.createdAt ? -1 : 1);
+      if(items.length === 0){ const e = create('div'); e.className='panel empty'; e.textContent='まだ問題がありません。'; view.appendChild(e); return; }
+
+      const tableWrap = create('div'); tableWrap.className='panel';
+      const table = create('table');
+      const thead = create('thead'); thead.innerHTML = `<tr><th>登録日</th><th>問題</th><th>回答</th><th>出題履歴（日時/○×）</th><th>次回予定</th></tr>`; table.appendChild(thead);
+      const tbody = create('tbody');
+
+      items.forEach(c=>{
+        const row = create('tr');
+        const createdTd = create('td'); createdTd.textContent = fmt(c.createdAt);
+
+        const qTd = create('td'); if(c.qImg){ const img = create('img'); img.src = c.qImg; img.className='thumb'; img.onclick = ()=> showImage(c.qImg); qTd.appendChild(img); } const qText = create('div'); qText.textContent = c.qText || ''; qTd.appendChild(qText);
+        const aTd = create('td'); if(c.aImg){ const img2 = create('img'); img2.src = c.aImg; img2.className='thumb'; img2.onclick = ()=> showImage(c.aImg); aTd.appendChild(img2); } const aText = create('div'); aText.textContent = c.aText || ''; aTd.appendChild(aText);
+
+        const histTd = create('td');
+        histTd.innerHTML = (c.attempts && c.attempts.length)
+          ? c.attempts.map((a,i)=>`<div>${i+1}回目：${fmt(a.date)} ${a.time||''} / ${a.correct? '○':'×'}</div>`).join('')
+          : '—';
+
+        const nextTd = create('td');
+        const nextVal = nextDueDate(c);
+        if(nextVal === null){ nextTd.innerHTML = `<div class='meta'>完了</div>`; }
+        else{
+          const dateInput = create('input'); dateInput.type='date'; dateInput.value = nextVal; dateInput.onchange = (e)=>{ const v = e.target.value; if(!v){ delete c.manualNextDue; } else { c.manualNextDue = v; } save(); /*即時保存*/ };
+          nextTd.appendChild(dateInput);
+          const ctrl = create('div'); ctrl.style.marginTop='6px';
+          const editBtn = create('button'); editBtn.className='btn btn-outline'; editBtn.textContent='✏️ 修正'; editBtn.onclick = ()=> go('edit',{listId,cardId:c.id});
+          const delBtn = create('button'); delBtn.className='btn btn-danger'; delBtn.textContent='🗑 削除'; delBtn.onclick = ()=>{ if(confirm('この問題を削除しますか？')){ deleteCard(c.id); render(); } };
+          ctrl.appendChild(editBtn); ctrl.appendChild(delBtn);
+          nextTd.appendChild(ctrl);
+        }
+
+        row.appendChild(createdTd);
+        row.appendChild(qTd);
+        row.appendChild(aTd);
+        row.appendChild(histTd);
+        row.appendChild(nextTd);
+        tbody.appendChild(row);
+      });
+
+      table.appendChild(tbody); tableWrap.appendChild(table); view.appendChild(tableWrap);
+    }
+
+    function renderEdit(view,{listId,cardId}){
+      const list = DB.lists.find(x=>x.id===listId); const c = DB.cards.find(x=>x.id===cardId); if(!list || !c){ goHome(); return; }
+      setTitle(`問題修正（${list.name}）`);
+      view.innerHTML = '';
+      const form = create('form'); form.className='panel'; form.innerHTML = `
+        <div style='display:flex;gap:12px;flex-wrap:wrap'><div style='flex:1;min-width:220px'><label>問題（文章）</label><textarea id='qText' rows='4'></textarea></div><div style='width:260px'><label>問題（画像）</label><input type='file' id='qImg' accept='image/*' /><img id='qPreview' class='thumb' style='display:none;margin-top:8px' /></div></div>
+        <div style='display:flex;gap:12px;flex-wrap:wrap;margin-top:12px'><div style='flex:1;min-width:220px'><label>回答（文章）</label><textarea id='aText' rows='4'></textarea></div><div style='width:260px'><label>回答（画像）</label><input type='file' id='aImg' accept='image/*' /><img id='aPreview' class='thumb' style='display:none;margin-top:8px' /></div></div>
+        <div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button class='btn btn-green'>保存</button><button type='button' id='cancelBtn' class='btn btn-outline'>キャンセル</button></div>
+      `;
+      view.appendChild(form);
+      $('#qText', form).value = c.qText || ''; $('#aText', form).value = c.aText || '';
+      if(c.qImg){ $('#qPreview', form).src = c.qImg; $('#qPreview', form).style.display = 'block'; } if(c.aImg){ $('#aPreview', form).src = c.aImg; $('#aPreview', form).style.display = 'block'; }
+
+      const qImg = $('#qImg', form); const aImg = $('#aImg', form);
+      qImg.onchange = async ()=>{ const f=qImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#qPreview', form).src = url; $('#qPreview', form).style.display='block'; }
+      aImg.onchange = async ()=>{ const f=aImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#aPreview', form).src = url; $('#aPreview', form).style.display='block'; }
+
+      $('#cancelBtn', form).onclick = ()=> goHome();
+      form.onsubmit = async (e)=>{ e.preventDefault(); const qText = $('#qText', form).value.trim(); const aText = $('#aText', form).value.trim(); let qImgData = c.qImg || ''; let aImgData = c.aImg || ''; if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]); if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]); if(!qText && !qImgData){ alert('問題は文章か画像のいずれかが必要です。'); return; } if(!aText && !aImgData){ alert('回答は文章か画像のいずれかが必要です。'); return; } updateCard(c.id,{qText,aText,qImg:qImgData,aImg:aImgData}); alert('保存しました'); go('problems',{listId}); };
+    }
+
+    // ==== modal image ====
+    const imgModal = $('#imgModal'); const imgModalImg = $('#imgModalImg');
+    function showImage(src){ imgModalImg.src = src; imgModal.style.display = 'flex'; }
+    imgModal.onclick = ()=> { imgModal.style.display = 'none'; imgModalImg.src=''; };
+
+    function setTitle(t){ $('.title').textContent = t; }
+    function escapeHtml(s=''){ return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    // ==== boot ====
+    if(stack.length === 0) stack.push({screen:'home', params:{}});
+    render();
+
+    // expose for debug
+    window._DB = DB;
+  })();
+  </script>
+</body>
+</html>
