@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>登録一覧</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    input, button { margin: 8px; padding: 8px; font-size: 16px; }
+    .question-card {
+      border: 1px solid #ccc;
+      border-radius: 12px;
+      padding: 12px;
+      margin: 8px 0;
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.2);
+    }
+    .question-actions {
+      margin-top: 8px;
+    }
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    .addBtn { background-color: #4CAF50; color: white; }
+    .quizBtn { background-color: #2196F3; color: white; }
+    .backBtn { background-color: #888; color: white; }
+  </style>
+</head>
+<body>
+  <h2>登録一覧</h2>
+  <div>
+    <input type="text" id="questionText" placeholder="問題文を入力">
+    <input type="file" id="questionImage">
+    <button class="addBtn" onclick="addQuestion()">追加</button>
+    <button class="backBtn" onclick="goIndex()">リスト一覧に戻る</button>
+  </div>
+  <hr>
+  <div id="questionContainer"></div>
+
+  <script src="script.js"></script>
+  <script>
+    renderQuestions();
+  </script>
+</body>
+</html>
