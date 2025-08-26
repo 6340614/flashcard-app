@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>フラッシュカード（ローカル・サーバ不要）</title>
+  <title>フラッシュカード（ローカル・サーバ不要 / IndexedDB版）</title>
   <style>
     :root{ --bg:#0b1220; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#22c55e; --blue:#3b82f6; --amber:#f59e0b; --violet:#8b5cf6; --danger:#ef4444; --slate:#64748b; --radius:14px; }
     html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:linear-gradient(180deg,var(--bg),#0f172a);color:var(--text)}
@@ -51,6 +51,9 @@
 
   <div id="imgModal" class="modal"><img id="imgModalImg" src="" alt=""/></div>
 
+  <!-- JSONインポート用の隠しinput（リスト単位） -->
+  <input type="file" id="importJsonInput" accept="application/json,.json" style="display:none" />
+
   <script>
   (function(){
     // ==== Utilities (JST対応) ====
@@ -79,27 +82,171 @@
 
     const SCHEDULE_OFFSETS = [0,1,3,7,14,30,90];
 
-    // ==== storage ====
-    const KEY = 'flashcards_local_v4';
-    function load(){ try{ const raw = localStorage.getItem(KEY); if(!raw) return {lists:[],cards:[]}; const d=JSON.parse(raw); d.lists ||= []; d.cards ||= []; return d;}catch(e){ console.error(e); return {lists:[],cards:[]}; } }
-    function save(){ localStorage.setItem(KEY, JSON.stringify(DB)); }
-    let DB = load();
+    // ==== IndexedDB（Blob対応） ====
+    const KEY_LOCALSTORAGE = 'flashcards_local_v4'; // 旧版キー（自動移行用）
+    const IDB_NAME = 'flashcards_idb_v1';
+    const IDB_VER = 1;
+    let idb;
 
-    // ==== navigation ====
-    const stack = [];
-    function go(screen, params={}){ stack.push({screen, params}); render(); }
-    function goHome(){ stack.length = 0; stack.push({screen:'home',params:{}}); render(); }
+    function openIDB(){
+      return new Promise((resolve, reject)=>{
+        const req = indexedDB.open(IDB_NAME, IDB_VER);
+        req.onupgradeneeded = (e)=>{
+          const db = e.target.result;
+          if(!db.objectStoreNames.contains('kv')){
+            db.createObjectStore('kv', { keyPath:'key' }); // {key:'db', value: <json>}
+          }
+          if(!db.objectStoreNames.contains('blobs')){
+            db.createObjectStore('blobs', { keyPath:'key' }); // {key:'img:...',{blob}}
+          }
+        };
+        req.onsuccess = ()=>{ idb = req.result; resolve(idb); };
+        req.onerror = ()=> reject(req.error);
+      });
+    }
+    function idbGet(store, key){
+      return new Promise((res,rej)=>{
+        const tx = idb.transaction(store,'readonly');
+        const st = tx.objectStore(store);
+        const r = st.get(key);
+        r.onsuccess = ()=> res(r.result);
+        r.onerror = ()=> rej(r.error);
+      });
+    }
+    function idbPut(store, val){
+      return new Promise((res,rej)=>{
+        const tx = idb.transaction(store,'readwrite');
+        const st = tx.objectStore(store);
+        const r = st.put(val);
+        r.onsuccess = ()=> res();
+        r.onerror = ()=> rej(r.error);
+      });
+    }
+    function idbDel(store, key){
+      return new Promise((res,rej)=>{
+        const tx = idb.transaction(store,'readwrite');
+        const st = tx.objectStore(store);
+        const r = st.delete(key);
+        r.onsuccess = ()=> res();
+        r.onerror = ()=> rej(r.error);
+      });
+    }
+
+    function dataURLtoBlob(dataURL){
+      const m = dataURL.match(/^data:(.*?);base64,(.*)$/);
+      if(!m) return null;
+      const mime = m[1]; const b64 = m[2];
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) u8[i] = bin.charCodeAt(i);
+      return new Blob([u8], {type:mime});
+    }
+
+    async function storeImageIfNeeded(card, which){ // which: 'q' | 'a'
+      const prop = which==='q' ? 'qImg' : 'aImg';
+      const refProp = which==='q' ? 'qImgRef' : 'aImgRef';
+      const val = card[prop];
+      if(!val){ 
+        if(card[refProp]){ try{ await idbDel('blobs', card[refProp]); }catch{} }
+        card[refProp] = null;
+        return;
+      }
+      if(typeof val === 'string' && val.startsWith('data:')){
+        const blob = dataURLtoBlob(val);
+        const key = `img:${uuid()}`;
+        await idbPut('blobs', {key, blob});
+        if(card[refProp] && card[refProp]!==key){ try{ await idbDel('blobs', card[refProp]); }catch{} }
+        card[refProp] = key;
+        return;
+      }
+    }
+
+    async function loadImageURLFromRef(ref){
+      if(!ref) return '';
+      const rec = await idbGet('blobs', ref);
+      if(!rec || !rec.blob) return '';
+      return URL.createObjectURL(rec.blob);
+    }
+
+    // ==== アプリの in-memory DB ====
+    let DB = {lists:[],cards:[]};
+
+    async function persistToIDB(){
+      for(const c of DB.cards){
+        await storeImageIfNeeded(c, 'q');
+        await storeImageIfNeeded(c, 'a');
+      }
+      const saveObj = {
+        lists: DB.lists.map(x=>({id:x.id,name:x.name,createdAt:x.createdAt})),
+        cards: DB.cards.map(c=>({
+          id:c.id, listId:c.listId, createdAt:c.createdAt,
+          qText:c.qText||'', aText:c.aText||'',
+          qImgRef:c.qImgRef||null, aImgRef:c.aImgRef||null,
+          attempts: (c.attempts||[]).map(a=>({date:a.date,time:a.time,correct:!!a.correct})),
+          manualNextDue: c.manualNextDue || null
+        }))
+      };
+      await idbPut('kv', {key:'db', value:saveObj});
+    }
+    function save(){ persistToIDB().catch(console.error); }
+
+    async function loadFromIDBOrMigrate(){
+      const rec = await idbGet('kv','db');
+      if(rec && rec.value){
+        const raw = rec.value;
+        const lists = raw.lists||[];
+        const cards = raw.cards||[];
+        const runtimeCards = [];
+        for(const c of cards){
+          const qURL = c.qImgRef ? (await loadImageURLFromRef(c.qImgRef)) : '';
+          const aURL = c.aImgRef ? (await loadImageURLFromRef(c.aImgRef)) : '';
+          runtimeCards.push({
+            id:c.id, listId:c.listId, createdAt:c.createdAt,
+            qText:c.qText||'', aText:c.aText||'',
+            qImg:qURL, aImg:aURL,
+            qImgRef:c.qImgRef||null, aImgRef:c.aImgRef||null,
+            attempts:c.attempts||[], manualNextDue:c.manualNextDue||null
+          });
+        }
+        DB = {lists, cards: runtimeCards};
+        return;
+      }
+      // migrate from localStorage (旧版)
+      try{
+        const rawLS = localStorage.getItem(KEY_LOCALSTORAGE);
+        if(rawLS){
+          const src = JSON.parse(rawLS);
+          src.lists ||= []; src.cards ||= [];
+          for(const c of src.cards){
+            if(c.qImg){ const b = dataURLtoBlob(c.qImg); const k = `img:${uuid()}`; await idbPut('blobs',{key:k, blob:b}); c.qImgRef = k; }
+            if(c.aImg){ const b = dataURLtoBlob(c.aImg); const k = `img:${uuid()}`; await idbPut('blobs',{key:k, blob:b}); c.aImgRef = k; }
+          }
+          await idbPut('kv', {key:'db', value:{
+            lists: src.lists.map(x=>({id:x.id,name:x.name,createdAt:x.createdAt})),
+            cards: src.cards.map(c=>({
+              id:c.id, listId:c.listId, createdAt:c.createdAt,
+              qText:c.qText||'', aText:c.aText||'',
+              qImgRef:c.qImgRef||null, aImgRef:c.aImgRef||null,
+              attempts:c.attempts||[], manualNextDue:c.manualNextDue||null
+            }))
+          }});
+          await loadFromIDBOrMigrate();
+          return;
+        }
+      }catch(e){ console.warn('migration failed', e); }
+      DB = {lists:[], cards:[]};
+    }
 
     // ==== schedule helpers ====
     function nextDueDate(card){
       const n = card.attempts?.length || 0;
       if(n >= 7) return null; // finished
-      if(card.manualNextDue) return card.manualNextDue; // manual override
-      if(n === 0) return card.createdAt; // 1回目＝登録日（JST）
+      if(card.manualNextDue) return card.manualNextDue;
+      if(n === 0) return card.createdAt;
       const lastDate = (card.attempts[n-1].date);
       const offset = SCHEDULE_OFFSETS[n];
       const [y,m,d] = lastDate.split('-').map(Number);
-      const base = new Date(Date.UTC(y, m-1, d)); // UTC基準で日付演算ズレ回避
+      const base = new Date(Date.UTC(y, m-1, d));
       base.setUTCDate(base.getUTCDate()+offset);
       const y2 = base.getUTCFullYear(); const m2 = pad2(base.getUTCMonth()+1); const d2 = pad2(base.getUTCDate());
       return `${y2}-${m2}-${d2}`;
@@ -108,17 +255,46 @@
 
     // ==== models ====
     function createList(name){ const id = uuid(); DB.lists.push({id,name,createdAt:jstTodayISO()}); save(); return id; }
-    function deleteList(id){ DB.lists = DB.lists.filter(l=>l.id!==id); DB.cards = DB.cards.filter(c=>c.listId!==id); save(); }
-    function createCard(listId, {qText,qImg,aText,aImg}){ const id = uuid(); DB.cards.push({id,listId,createdAt:jstTodayISO(),qText:qText||'',qImg:qImg||'',aText:aText||'',aImg:aImg||'',attempts:[],manualNextDue:null}); save(); return id; }
-    function updateCard(id, patch){ const c = DB.cards.find(x=>x.id===id); if(!c) return; Object.assign(c, patch); save(); }
-    function deleteCard(id){ DB.cards = DB.cards.filter(x=>x.id!==id); save(); }
+    function deleteList(id){
+      const related = DB.cards.filter(c=>c.listId===id);
+      Promise.all(related.map(async c=>{
+        if(c.qImgRef) await idbDel('blobs', c.qImgRef).catch(()=>{});
+        if(c.aImgRef) await idbDel('blobs', c.aImgRef).catch(()=>{});
+      })).finally(()=>{});
+      DB.lists = DB.lists.filter(l=>l.id!==id);
+      DB.cards = DB.cards.filter(c=>c.listId!==id);
+      save();
+    }
+    function createCard(listId, {qText,qImg,aText,aImg}){
+      const id = uuid();
+      DB.cards.push({id,listId,createdAt:jstTodayISO(),qText:qText||'',qImg:qImg||'',aText:aText||'',aImg:aImg||'',attempts:[],manualNextDue:null,qImgRef:null,aImgRef:null});
+      save();
+      return id;
+    }
+    function updateCard(id, patch){
+      const c = DB.cards.find(x=>x.id===id); if(!c) return;
+      Object.assign(c, patch);
+      save();
+    }
+    function deleteCard(id){
+      const c = DB.cards.find(x=>x.id===id);
+      if(c){
+        if(c.qImgRef) idbDel('blobs', c.qImgRef).catch(()=>{});
+        if(c.aImgRef) idbDel('blobs', c.aImgRef).catch(()=>{});
+      }
+      DB.cards = DB.cards.filter(x=>x.id!==id);
+      save();
+    }
     const listCards = (listId)=> DB.cards.filter(x=>x.listId===listId);
 
     // ==== UI render ====
+    const stack = [];
+    function go(screen, params={}){ stack.push({screen, params}); render(); }
+    function goHome(){ stack.length = 0; stack.push({screen:'home',params:{}}); render(); }
+
     function render(){
       const view = $('#view');
       const top = stack[stack.length-1] || {screen:'home',params:{}};
-      // 出題モード含め、ホーム以外は常に戻る表示→ホームに戻る
       $('#backBtn').style.display = top.screen !== 'home' ? 'inline-flex' : 'none';
       $('#backBtn').onclick = ()=> goHome();
 
@@ -144,7 +320,8 @@
         <label style="color:var(--muted);font-size:13px">リスト名</label>
         <input id="newListName" placeholder="例：英単語、歴史、資格…" />
         <div style="margin-top:10px;display:flex;gap:8px"><button id="createListBtn" class="btn btn-green">＋ 作成</button></div>
-        <div style="margin-top:8px;color:var(--muted);font-size:13px">全データは端末ローカル（localStorage）に保存されます。JST基準で日付保存。</div>
+        <div id="capacityLine" style="margin-top:8px;color:var(--muted);font-size:13px">容量確認中…</div>
+        <div style="margin-top:8px;color:var(--muted);font-size:13px">全データは端末ローカル（IndexedDB/Blob）に保存されます。JST基準で日付保存。</div>
       `;
       wrap.appendChild(form);
 
@@ -152,8 +329,9 @@
       listsPanel.innerHTML = `<h3 style="margin:0 0 8px 0">リスト一覧</h3>`;
       const grid = create('div'); grid.className='listgrid';
 
-      if(DB.lists.length === 0){ const e = create('div'); e.className='empty'; e.textContent='リストがありません。上の「リスト作成」から追加してください。'; listsPanel.appendChild(e); }
-      else{
+      if(DB.lists.length === 0){
+        const e = create('div'); e.className='empty'; e.textContent='リストがありません。上の「リスト作成」から追加してください。'; listsPanel.appendChild(e);
+      }else{
         DB.lists.forEach(l=>{
           const total = listCards(l.id).length;
           const due = listCards(l.id).filter(isDueTodayOrPast).length;
@@ -161,10 +339,11 @@
           const h = create('h4'); h.textContent = l.name; card.appendChild(h);
           const m = create('div'); m.className='meta'; m.textContent = `作成 ${fmt(l.createdAt)} ・ 登録 ${total} 件 ・ 期日到来 ${due} 件`; card.appendChild(m);
           const tb = create('div'); tb.className='toolbar';
-          // 選択ボタンは不要 → 削除
           const add = create('button'); add.className='btn btn-blue'; add.textContent='✏️ 問題登録'; add.onclick = ()=> go('register',{listId:l.id}); tb.appendChild(add);
           const prob = create('button'); prob.className='btn btn-amber'; prob.textContent='📋 問題一覧'; prob.onclick = ()=> go('problems',{listId:l.id}); tb.appendChild(prob);
           const quiz = create('button'); quiz.className='btn btn-violet'; quiz.textContent='📝 出題開始'; quiz.onclick = ()=> go('quiz',{listId:l.id}); tb.appendChild(quiz);
+          const exp = create('button'); exp.className='btn btn-outline'; exp.textContent='⬇️ エクスポート'; exp.onclick = ()=> exportListById(l.id); tb.appendChild(exp);
+          const imp = create('button'); imp.className='btn btn-outline'; imp.textContent='⬆️ インポート'; imp.onclick = ()=> importFromJson(); tb.appendChild(imp);
           const del = create('button'); del.className='btn btn-danger'; del.textContent='🗑 削除'; del.onclick = ()=>{ if(confirm(`「${l.name}」を削除しますか？（中の問題も削除されます）`)){ deleteList(l.id); render(); } }; tb.appendChild(del);
           card.appendChild(tb); grid.appendChild(card);
         });
@@ -180,7 +359,10 @@
         const id = createList(name);
         $('#newListName').value='';
         go('listMenu',{listId:id});
-      }
+      };
+
+      // 容量表示を更新
+      updateCapacityLine();
     }
 
     function renderListMenu(view,{listId}){
@@ -235,7 +417,7 @@
           <button type="button" class="btn btn-outline" id="clearBtn">クリア</button>
           <button type="button" class="btn btn-amber" id="toListBtn">📋 問題一覧へ</button>
         </div>
-        <div style="margin-top:8px;color:var(--muted);font-size:13px">文章・画像は両方とも空にできません。画像は自動圧縮保存（JPG）されます。</div>
+        <div style="margin-top:8px;color:var(--muted);font-size:13px">文章・画像は両方とも空にできません。画像は自動圧縮保存（JPG, IndexedDBにBlobとして保存）されます。</div>
       `;
       view.appendChild(form);
 
@@ -245,7 +427,22 @@
       $('#clearBtn', form).onclick = ()=>{ $('#qText', form).value=''; $('#aText', form).value=''; $('#qPreview', form).style.display='none'; $('#aPreview', form).style.display='none'; qImg.value=''; aImg.value=''; }
       $('#toListBtn', form).onclick = ()=> go('problems',{listId});
 
-      form.onsubmit = async (e)=>{ e.preventDefault(); const qText = $('#qText', form).value.trim(); const aText = $('#aText', form).value.trim(); let qImgData=''; let aImgData=''; if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]); if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]); if(!qText && !qImgData){ alert('問題の文章または画像を入力してください'); return; } if(!aText && !aImgData){ alert('回答の文章または画像を入力してください'); return; } createCard(listId,{qText,qImg:qImgData,aText,aImg:aImgData}); if(confirm('登録しました。続けて登録しますか？')){ $('#qText', form).value=''; $('#aText', form).value=''; $('#qPreview', form).style.display='none'; $('#aPreview', form).style.display='none'; qImg.value=''; aImg.value=''; } else { go('listMenu',{listId}); } };
+      form.onsubmit = async (e)=>{
+        e.preventDefault();
+        const qText = $('#qText', form).value.trim();
+        const aText = $('#aText', form).value.trim();
+        let qImgData=''; let aImgData='';
+        if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]);
+        if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]);
+        if(!qText && !qImgData){ alert('問題の文章または画像を入力してください'); return; }
+        if(!aText && !aImgData){ alert('回答の文章または画像を入力してください'); return; }
+        createCard(listId,{qText,qImg:qImgData,aText,aImg:aImgData});
+        if(confirm('登録しました。続けて登録しますか？')){
+          $('#qText', form).value=''; $('#aText', form).value='';
+          $('#qPreview', form).style.display='none'; $('#aPreview', form).style.display='none';
+          qImg.value=''; aImg.value='';
+        } else { go('listMenu',{listId}); }
+      };
     }
 
     function renderQuiz(view,{listId}){
@@ -253,27 +450,65 @@
       setTitle(`出題（${list.name}）`);
       view.innerHTML = '';
       const due = listCards(listId).filter(c=> isDueTodayOrPast(c) && (c.attempts?.length || 0) < 7);
-      if(due.length === 0){ const p = create('div'); p.className='panel empty'; p.innerHTML = `<div>本日出題する問題はありません。</div><div style="margin-top:10px"><button class='btn btn-slate' id='toHomeBtn'>🏠 リスト一覧へ</button></div>`; view.appendChild(p); $('#toHomeBtn').onclick = ()=> goHome(); return; }
+      if(due.length === 0){
+        const p = create('div'); p.className='panel empty';
+        p.innerHTML = `<div>本日出題する問題はありません。</div><div style="margin-top:10px"><button class='btn btn-slate' id='toHomeBtn'>🏠 リスト一覧へ</button></div>`;
+        view.appendChild(p); $('#toHomeBtn').onclick = ()=> goHome(); return;
+      }
 
       due.sort((a,b)=>{ const da = nextDueDate(a) || '9999-99-99'; const db = nextDueDate(b) || '9999-99-99'; if(da !== db) return da < db ? -1 : 1; return a.createdAt < b.createdAt ? -1 : 1; });
 
       let idx = 0;
       const wrap = create('div'); wrap.className='stack';
-      const top = create('div'); top.className='panel'; top.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div><div class='meta'>残り <span id='remain'>${due.length}</span> 問</div><div class='meta'>本日 ${fmt(jstTodayISO())}</div></div><div></div></div>`;
-      const qPanel = create('div'); qPanel.className='panel'; qPanel.style.marginTop='10px'; qPanel.innerHTML = `<div id='qArea' class='quiz-q'></div><div id='qImgArea' style='margin-top:10px'></div><div style='margin-top:12px'><button id='revealBtn' class='btn btn-blue'>答えを見る</button></div><div id='answerBox' style='display:none;margin-top:12px'><div id='aArea' class='quiz-a'></div><div id='aImgArea' style='margin-top:8px'></div><div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button id='correctBtn' class='btn btn-green'>○ 正解</button><button id='wrongBtn' class='btn btn-danger'>× 不正解</button></div></div>`;
-      const histPanel = create('div'); histPanel.className='panel'; histPanel.style.marginTop='10px'; histPanel.innerHTML = `<h4 style='margin:0 0 8px 0'>この問題の履歴</h4><div id='hist'></div>`;
-      const donePanel = create('div'); donePanel.className='panel'; donePanel.style.display='none'; donePanel.innerHTML = `<div class='empty'>本日の出題は全て終了しました。<div style='margin-top:10px'><button id='toHome' class='btn btn-slate'>🏠 リスト一覧へ</button></div></div>`;
+      const top = create('div'); top.className='panel';
+      top.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div><div class='meta'>残り <span id='remain'>${due.length}</span> 問</div><div class='meta'>本日 ${fmt(jstTodayISO())}</div></div><div></div></div>`;
+      const qPanel = create('div'); qPanel.className='panel'; qPanel.style.marginTop='10px';
+      qPanel.innerHTML = `<div id='qArea' class='quiz-q'></div><div id='qImgArea' style='margin-top:10px'></div><div style='margin-top:12px'><button id='revealBtn' class='btn btn-blue'>答えを見る</button></div><div id='answerBox' style='display:none;margin-top:12px'><div id='aArea' class='quiz-a'></div><div id='aImgArea' style='margin-top:8px'></div><div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button id='correctBtn' class='btn btn-green'>○ 正解</button><button id='wrongBtn' class='btn btn-danger'>× 不正解</button></div></div>`;
+      const histPanel = create('div'); histPanel.className='panel'; histPanel.style.marginTop='10px';
+      histPanel.innerHTML = `<h4 style='margin:0 0 8px 0'>この問題の履歴</h4><div id='hist'></div>`;
+      const donePanel = create('div'); donePanel.className='panel'; donePanel.style.display='none';
+      donePanel.innerHTML = `<div class='empty'>本日の出題は全て終了しました。<div style='margin-top:10px'><button id='toHome' class='btn btn-slate'>🏠 リスト一覧へ</button></div></div>`;
 
       wrap.appendChild(top); wrap.appendChild(qPanel); wrap.appendChild(histPanel); wrap.appendChild(donePanel); view.appendChild(wrap);
 
-      function renderCard(){ const c = due[idx]; $('#qArea').textContent = c.qText || (c.qImg? '（画像問題）':''); $('#qImgArea').innerHTML = c.qImg? `<img src='${c.qImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : ''; $('#aArea').textContent = c.aText || (c.aImg? '（画像回答）':''); $('#aImgArea').innerHTML = c.aImg? `<img src='${c.aImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : ''; $('#answerBox').style.display='none'; renderHistory(c); }
-      function renderHistory(c){ const el = $('#hist'); if(!(c.attempts && c.attempts.length)) { el.innerHTML = `<div class='meta'>履歴はまだありません。初回出題日：${fmt(nextDueDate(c))}</div>`; return; } const rows = c.attempts.map((a,i)=>`<div style='display:flex;justify-content:space-between'><div><span class='meta'>${i+1}回目</span> ${fmt(a.date)} ${a.time||''}</div><div><span class='meta'>${a.correct? '正解':'不正解'}</span></div></div>`).join(''); const next = nextDueDate(c); el.innerHTML = rows + (next? `<div style='margin-top:8px' class='meta'>次回出題予定日：${fmt(next)}</div>` : `<div style='margin-top:8px' class='meta'>7回目まで完了。以降の出題はありません。</div>`); }
+      function renderCard(){
+        const c = due[idx];
+        $('#qArea').textContent = c.qText || (c.qImg? '（画像問題）':'');
+        $('#qImgArea').innerHTML = c.qImg? `<img src='${c.qImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : '';
+        $('#aArea').textContent = c.aText || (c.aImg? '（画像回答）':'');
+        $('#aImgArea').innerHTML = c.aImg? `<img src='${c.aImg}' style='max-width:260px;max-height:260px;object-fit:contain' />` : '';
+        $('#answerBox').style.display='none';
+        renderHistory(c);
+      }
+      function renderHistory(c){
+        const el = $('#hist');
+        if(!(c.attempts && c.attempts.length)) {
+          el.innerHTML = `<div class='meta'>履歴はまだありません。初回出題日：${fmt(nextDueDate(c))}</div>`;
+          return;
+        }
+        const rows = c.attempts.map((a,i)=>`<div style='display:flex;justify-content:space-between'><div><span class='meta'>${i+1}回目</span> ${fmt(a.date)} ${a.time||''}</div><div><span class='meta'>${a.correct? '正解':'不正解'}</span></div></div>`).join('');
+        const next = nextDueDate(c);
+        el.innerHTML = rows + (next? `<div style='margin-top:8px' class='meta'>次回出題予定日：${fmt(next)}</div>` : `<div style='margin-top:8px' class='meta'>7回目まで完了。以降の出題はありません。</div>`);
+      }
 
       $('#revealBtn').onclick = ()=> { $('#answerBox').style.display='block'; };
       $('#correctBtn').onclick = ()=> grade(true);
       $('#wrongBtn').onclick = ()=> grade(false);
 
-      function grade(correct){ const c = due[idx]; c.attempts.push({date: jstTodayISO(), time: jstTime(), correct}); if(c.manualNextDue) delete c.manualNextDue; save(); idx++; if(idx>=due.length){ qPanel.style.display='none'; donePanel.style.display='block'; $('#toHome').onclick = ()=> goHome(); } else { $('#remain').textContent = (due.length - idx); renderCard(); } }
+      function grade(correct){
+        const c = due[idx];
+        c.attempts.push({date: jstTodayISO(), time: jstTime(), correct});
+        if(c.manualNextDue) delete c.manualNextDue;
+        save();
+        idx++;
+        if(idx>=due.length){
+          qPanel.style.display='none'; donePanel.style.display='block';
+          $('#toHome').onclick = ()=> goHome();
+        } else {
+          $('#remain').textContent = (due.length - idx);
+          renderCard();
+        }
+      }
 
       renderCard();
     }
@@ -282,7 +517,8 @@
       const list = DB.lists.find(x=>x.id===listId); if(!list){ goHome(); return; }
       setTitle(`問題一覧（${list.name}）`);
       view.innerHTML = '';
-      const head = create('div'); head.className='panel'; head.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center'><div><h3 style='margin:0'>登録問題</h3><div class='meta'>合計 ${listCards(listId).length} 件</div></div><div><button id='addNew' class='btn btn-blue'>＋ 新規登録</button></div></div>`;
+      const head = create('div'); head.className='panel';
+      head.innerHTML = `<div style='display:flex;justify-content:space-between;align-items:center'><div><h3 style='margin:0'>登録問題</h3><div class='meta'>合計 ${listCards(listId).length} 件</div></div><div><button id='addNew' class='btn btn-blue'>＋ 新規登録</button></div></div>`;
       view.appendChild(head);
       $('#addNew').onclick = ()=> go('register',{listId});
 
@@ -298,8 +534,13 @@
         const row = create('tr');
         const createdTd = create('td'); createdTd.textContent = fmt(c.createdAt);
 
-        const qTd = create('td'); if(c.qImg){ const img = create('img'); img.src = c.qImg; img.className='thumb'; img.onclick = ()=> showImage(c.qImg); qTd.appendChild(img); } const qText = create('div'); qText.textContent = c.qText || ''; qTd.appendChild(qText);
-        const aTd = create('td'); if(c.aImg){ const img2 = create('img'); img2.src = c.aImg; img2.className='thumb'; img2.onclick = ()=> showImage(c.aImg); aTd.appendChild(img2); } const aText = create('div'); aText.textContent = c.aText || ''; aTd.appendChild(aText);
+        const qTd = create('td');
+        if(c.qImg){ const img = create('img'); img.src = c.qImg; img.className='thumb'; img.onclick = ()=> showImage(c.qImg); qTd.appendChild(img); }
+        const qText = create('div'); qText.textContent = c.qText || ''; qTd.appendChild(qText);
+
+        const aTd = create('td');
+        if(c.aImg){ const img2 = create('img'); img2.src = c.aImg; img2.className='thumb'; img2.onclick = ()=> showImage(c.aImg); aTd.appendChild(img2); }
+        const aText = create('div'); aText.textContent = c.aText || ''; aTd.appendChild(aText);
 
         const histTd = create('td');
         histTd.innerHTML = (c.attempts && c.attempts.length)
@@ -308,10 +549,17 @@
 
         const nextTd = create('td');
         const nextVal = nextDueDate(c);
-        if(nextVal === null){ nextTd.innerHTML = `<div class='meta'>完了</div>`; }
-        else{
-          const dateInput = create('input'); dateInput.type='date'; dateInput.value = nextVal; dateInput.onchange = (e)=>{ const v = e.target.value; if(!v){ delete c.manualNextDue; } else { c.manualNextDue = v; } save(); /*即時保存*/ };
+        if(nextVal === null){
+          nextTd.innerHTML = `<div class='meta'>完了</div>`;
+        }else{
+          const dateInput = create('input'); dateInput.type='date'; dateInput.value = nextVal;
+          dateInput.onchange = (e)=>{
+            const v = e.target.value;
+            if(!v){ delete c.manualNextDue; } else { c.manualNextDue = v; }
+            save();
+          };
           nextTd.appendChild(dateInput);
+
           const ctrl = create('div'); ctrl.style.marginTop='6px';
           const editBtn = create('button'); editBtn.className='btn btn-outline'; editBtn.textContent='✏️ 修正'; editBtn.onclick = ()=> go('edit',{listId,cardId:c.id});
           const delBtn = create('button'); delBtn.className='btn btn-danger'; delBtn.textContent='🗑 削除'; delBtn.onclick = ()=>{ if(confirm('この問題を削除しますか？')){ deleteCard(c.id); render(); } };
@@ -335,20 +583,39 @@
       setTitle(`問題修正（${list.name}）`);
       view.innerHTML = '';
       const form = create('form'); form.className='panel'; form.innerHTML = `
-        <div style='display:flex;gap:12px;flex-wrap:wrap'><div style='flex:1;min-width:220px'><label>問題（文章）</label><textarea id='qText' rows='4'></textarea></div><div style='width:260px'><label>問題（画像）</label><input type='file' id='qImg' accept='image/*' /><img id='qPreview' class='thumb' style='display:none;margin-top:8px' /></div></div>
-        <div style='display:flex;gap:12px;flex-wrap:wrap;margin-top:12px'><div style='flex:1;min-width:220px'><label>回答（文章）</label><textarea id='aText' rows='4'></textarea></div><div style='width:260px'><label>回答（画像）</label><input type='file' id='aImg' accept='image/*' /><img id='aPreview' class='thumb' style='display:none;margin-top:8px' /></div></div>
+        <div style='display:flex;gap:12px;flex-wrap:wrap'>
+          <div style='flex:1;min-width:220px'><label>問題（文章）</label><textarea id='qText' rows='4'></textarea></div>
+          <div style='width:260px'><label>問題（画像）</label><input type='file' id='qImg' accept='image/*' /><img id='qPreview' class='thumb' style='display:none;margin-top:8px' /></div>
+        </div>
+        <div style='display:flex;gap:12px;flex-wrap:wrap;margin-top:12px'>
+          <div style='flex:1;min-width:220px'><label>回答（文章）</label><textarea id='aText' rows='4'></textarea></div>
+          <div style='width:260px'><label>回答（画像）</label><input type='file' id='aImg' accept='image/*' /><img id='aPreview' class='thumb' style='display:none;margin-top:8px' /></div>
+        </div>
         <div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button class='btn btn-green'>保存</button><button type='button' id='cancelBtn' class='btn btn-outline'>キャンセル</button></div>
       `;
       view.appendChild(form);
       $('#qText', form).value = c.qText || ''; $('#aText', form).value = c.aText || '';
-      if(c.qImg){ $('#qPreview', form).src = c.qImg; $('#qPreview', form).style.display = 'block'; } if(c.aImg){ $('#aPreview', form).src = c.aImg; $('#aPreview', form).style.display = 'block'; }
+      if(c.qImg){ $('#qPreview', form).src = c.qImg; $('#qPreview', form).style.display = 'block'; }
+      if(c.aImg){ $('#aPreview', form).src = c.aImg; $('#aPreview', form).style.display = 'block'; }
 
       const qImg = $('#qImg', form); const aImg = $('#aImg', form);
       qImg.onchange = async ()=>{ const f=qImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#qPreview', form).src = url; $('#qPreview', form).style.display='block'; }
       aImg.onchange = async ()=>{ const f=aImg.files[0]; if(!f) return; const url = await fileToDataURLCompressed(f); $('#aPreview', form).src = url; $('#aPreview', form).style.display='block'; }
 
       $('#cancelBtn', form).onclick = ()=> goHome();
-      form.onsubmit = async (e)=>{ e.preventDefault(); const qText = $('#qText', form).value.trim(); const aText = $('#aText', form).value.trim(); let qImgData = c.qImg || ''; let aImgData = c.aImg || ''; if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]); if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]); if(!qText && !qImgData){ alert('問題は文章か画像のいずれかが必要です。'); return; } if(!aText && !aImgData){ alert('回答は文章か画像のいずれかが必要です。'); return; } updateCard(c.id,{qText,aText,qImg:qImgData,aImg:aImgData}); alert('保存しました'); go('problems',{listId}); };
+      form.onsubmit = async (e)=>{
+        e.preventDefault();
+        const qText = $('#qText', form).value.trim();
+        const aText = $('#aText', form).value.trim();
+        let qImgData = c.qImg || ''; let aImgData = c.aImg || '';
+        if(qImg.files[0]) qImgData = await fileToDataURLCompressed(qImg.files[0]);
+        if(aImg.files[0]) aImgData = await fileToDataURLCompressed(aImg.files[0]);
+        if(!qText && !qImgData){ alert('問題は文章か画像のいずれかが必要です。'); return; }
+        if(!aText && !aImgData){ alert('回答は文章か画像のいずれかが必要です。'); return; }
+        updateCard(c.id,{qText,aText,qImg:qImgData,aImg:aImgData});
+        alert('保存しました');
+        go('problems',{listId});
+      };
     }
 
     // ==== modal image ====
@@ -359,12 +626,153 @@
     function setTitle(t){ $('.title').textContent = t; }
     function escapeHtml(s=''){ return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-    // ==== boot ====
-    if(stack.length === 0) stack.push({screen:'home', params:{}});
-    render();
+    // ==== リスト毎エクスポート ====
+    async function exportListById(listId){
+      const list = DB.lists.find(l=>l.id===listId);
+      if(!list){ alert('リストが見つかりません'); return; }
+      const cards = listCards(listId);
 
-    // expose for debug
-    window._DB = DB;
+      async function blobRefToDataURL(ref){
+        if(!ref) return '';
+        const rec = await idbGet('blobs', ref);
+        if(!rec || !rec.blob) return '';
+        return await new Promise((res,rej)=>{
+          const fr = new FileReader();
+          fr.onload = ()=> res(fr.result);
+          fr.onerror = rej;
+          fr.readAsDataURL(rec.blob);
+        });
+      }
+
+      const out = {
+        type: 'flashcard-list',
+        version: 1,
+        list: { id:list.id, name:list.name, createdAt:list.createdAt },
+        cards: await Promise.all(cards.map(async c=>({
+          id: c.id,
+          createdAt: c.createdAt,
+          qText: c.qText || '',
+          aText: c.aText || '',
+          qImg: await blobRefToDataURL(c.qImgRef || null),
+          aImg: await blobRefToDataURL(c.aImgRef || null),
+          attempts: (c.attempts||[]).map(a=>({date:a.date,time:a.time,correct:!!a.correct})),
+          manualNextDue: c.manualNextDue || null
+        })))
+      };
+
+      const blob = new Blob([JSON.stringify(out)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const safe = list.name.replace(/[\\/:*?"<>|]/g,'_');
+      a.download = `${safe}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    // ==== リスト単位インポート（JSON → IndexedDB復元） ====
+    function importFromJson(){
+      const input = $('#importJsonInput');
+      input.value = '';
+      input.onchange = async (e)=>{
+        try{
+          const file = e.target.files?.[0];
+          if(!file) return;
+          const text = await file.text();
+          const data = JSON.parse(text);
+
+          // フォーマットチェック（エクスポートと同形式）
+          if(!data || data.type!=='flashcard-list' || !data.list || !Array.isArray(data.cards)){
+            alert('インポート失敗：ファイル形式が不正です（エクスポートしたJSONを指定してください）');
+            return;
+          }
+
+          // リスト名の重複回避
+          let name = String(data.list.name||'Imported').trim() || 'Imported';
+          const names = new Set(DB.lists.map(l=>l.name));
+          if(names.has(name)){
+            let i=2;
+            while(names.has(`${name} (${i})`)) i++;
+            name = `${name} (${i})`;
+          }
+
+          // 新規リスト作成
+          const newListId = createList(name);
+
+          // 画像（dataURL）→ Blob → blobs ストアへ保存し参照キー取得、ランタイムURL生成
+          async function dataUrlToRefAndUrl(dataUrl){
+            if(!dataUrl) return {ref:null,url:''};
+            const blob = dataURLtoBlob(dataUrl);
+            const key = `img:${uuid()}`;
+            await idbPut('blobs', {key, blob});
+            const url = URL.createObjectURL(blob);
+            return {ref:key, url};
+          }
+
+          // カード復元
+          for(const src of data.cards){
+            const q = await dataUrlToRefAndUrl(src.qImg||'');
+            const a = await dataUrlToRefAndUrl(src.aImg||'');
+            const id = uuid();
+            DB.cards.push({
+              id,
+              listId: newListId,
+              createdAt: src.createdAt || jstTodayISO(),
+              qText: src.qText || '',
+              aText: src.aText || '',
+              qImg: q.url,
+              aImg: a.url,
+              qImgRef: q.ref,
+              aImgRef: a.ref,
+              attempts: Array.isArray(src.attempts) ? src.attempts.map(v=>({date:v.date,time:v.time,correct:!!v.correct})) : [],
+              manualNextDue: src.manualNextDue || null
+            });
+          }
+          save();
+          alert('インポートが完了しました。');
+          goHome();
+        }catch(err){
+          console.error(err);
+          alert('インポートに失敗しました。ファイルを確認してください。');
+        }
+      };
+      input.click();
+    }
+
+    // ==== 容量確認（フォーム直下に表示） ====
+    async function updateCapacityLine(){
+      const el = $('#capacityLine');
+      try{
+        if(navigator.storage?.estimate){
+          const est = await navigator.storage.estimate();
+          const used = est.usage ?? 0;
+          const quota = est.quota ?? 0;
+          const toMB = b => (b/(1024*1024)).toFixed(2);
+          const free = quota - used;
+          el.textContent = `容量：使用 ${toMB(used)} MB / 上限 ${toMB(quota)} MB（残り 約 ${toMB(Math.max(0,free))} MB）`;
+        }else{
+          el.textContent = '容量：このブラウザでは取得できません';
+        }
+      }catch{
+        el.textContent = '容量：取得に失敗しました';
+      }
+    }
+
+    // ==== boot ====
+    async function boot(){
+      await openIDB();
+      await loadFromIDBOrMigrate();
+      if(stack.length === 0) stack.push({screen:'home', params:{}});
+      render();
+      // デバッグ用
+      window._DB = DB;
+      window._exportListById = exportListById;
+      window._importFromJson = importFromJson;
+    }
+    boot();
+
   })();
   </script>
 </body>
